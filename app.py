@@ -17,7 +17,8 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 SENDER_EMAIL = os.getenv("SENDER_EMAIL")
 SENDER_PASSWORD = os.getenv("SENDER_PASSWORD")
 
-app = Flask(__name__)
+# Tell Flask to use /static as public folder
+app = Flask(__name__, static_folder="static", static_url_path="/static")
 
 def get_airtable_records():
     url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_NAME}"
@@ -85,59 +86,20 @@ def generate_full_html_with_groq(location, image_urls, labels, recommendations, 
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     prompt = f"""
-Generate a beautiful, modern HTML email using inline CSS.
-
-Requirements:
-- Add a bold, stylish header with the city name: {location}.
-- Show 3 image cards, each with:
-    • the image as a clickable link to Google Maps (https://www.google.com/maps/search/?api=1&query=LANDMARK+CITY),
-    • a beautiful title for the landmark,
-    • a short recommendation below.
-- Style the images with rounded corners, soft shadows, max-width ~300px.
-- Use a soft background color or gradient.
-- At the bottom, add:
-    • a large map image: {map_image},
-    • two side-by-side buttons:
-        - green "Approve" button (http://localhost:5000/approve?id={record_id}),
-        - red "Reject" button (http://localhost:5000/reject?id={record_id}),
-    • a form with a textarea and submit button:
-        → action: http://localhost:5000/reject
-        → hidden input name='id' value='{record_id}'
-        → textarea name='adjustment'
-        → submit button label: 'Submit Adjustments'
-        → style it clean, rounded, with soft shadow.
-Important:
-- Do NOT include comments, notes, or explanations in the HTML.
-- Only return the HTML code.
+Generate a beautiful HTML email with inline CSS.
+Include:
+- Header: {location}
+- 3 image cards with Google Maps links, titles, recommendations
+- Soft background, rounded images, shadows
+- Bottom: map image {map_image}, approve + reject buttons, feedback form.
+- Approve button → <a href='http://localhost:5000/approve?id={record_id}'> styled green
+- Reject button → <a href='http://localhost:5000/reject?id={record_id}'> styled red
+- Feedback form → action='http://localhost:5000/reject', hidden input 'id'={record_id}, textarea 'adjustment'
+Return only the HTML code, no explanations.
 """
     for i in range(3):
         maps_url = f"https://www.google.com/maps/search/?api=1&query={labels[i].replace(' ', '+')}+{location.replace(' ', '+')}"
         prompt += f"\n- Image {i+1}: {image_urls[i]}, Label: {labels[i]}, Recommendation: {recommendations[i]}, Maps URL: {maps_url}"
-    prompt += "\nReturn only the HTML code."
-    data = {
-        "model": "llama3-70b-8192",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.7
-    }
-    response = requests.post(url, headers=headers, json=data)
-    html = response.json()["choices"][0]["message"]["content"]
-    return html
-
-def generate_adjusted_html_with_groq(old_html, adjustment):
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-    prompt = f"""
-Here’s the previous HTML email:
-{old_html}
-
-The user requested this adjustment:
-{adjustment}
-
-Regenerate the HTML email accordingly, improving the design as requested.
-- Use inline CSS.
-- Keep the layout, buttons, and form functional.
-- Do NOT add comments or explanations — return only the updated HTML.
-"""
     data = {
         "model": "llama3-70b-8192",
         "messages": [{"role": "user", "content": prompt}],
@@ -160,11 +122,40 @@ def send_email(recipient, subject, body):
 @app.route("/approve")
 def approve():
     record_id = request.args.get("id")
-    url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_NAME}/{record_id}"
-    headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}", "Content-Type": "application/json"}
-    data = {"fields": {"Status": "approved"}}
-    response = requests.patch(url, headers=headers, json=data)
-    return "✅ Approved!" if response.ok else f"❌ Failed: {response.text}"
+    record_url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_NAME}/{record_id}"
+    headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
+    record_resp = requests.get(record_url, headers=headers)
+    record = record_resp.json()
+    location = record["fields"].get("Location")
+    email = record["fields"].get("Email")
+    image_urls, captions = fetch_images(location)
+    labels, recommendations = process_images_with_groq(image_urls, captions, location)
+    map_image = get_static_map_with_markers(labels, location)
+    html = generate_full_html_with_groq(location, image_urls, labels, recommendations, map_image, record_id)
+    send_email(email, f"✅ Approved travel page for {location}", html)
+
+    # ✅ Get absolute path to static/approved_html
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    save_dir = os.path.join(project_root, "static", "approved_html")
+    os.makedirs(save_dir, exist_ok=True)
+    file_path = os.path.join(save_dir, f"{record_id}.html")
+
+    # ✅ Save HTML file
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"✅ Saved HTML file to: {file_path}")
+
+    # ✅ Construct public link
+    html_link = f"http://localhost:5000/static/approved_html/{record_id}.html"
+
+    # ✅ Update Airtable with link
+    patch_data = {"fields": {"Status": "approved", "Notes": html_link}}
+    patch_resp = requests.patch(record_url, headers={**headers, "Content-Type": "application/json"}, json=patch_data)
+
+    if patch_resp.ok:
+        return "✅ Approved and link saved to Airtable!"
+    else:
+        return f"❌ Approved but failed to save to Airtable: {patch_resp.text}"
 
 @app.route("/reject")
 def reject():
@@ -179,8 +170,7 @@ def reject():
     image_urls, captions = fetch_images(location)
     labels, recommendations = process_images_with_groq(image_urls, captions, location)
     map_image = get_static_map_with_markers(labels, location)
-    old_html = generate_full_html_with_groq(location, image_urls, labels, recommendations, map_image, record_id)
-    html = generate_adjusted_html_with_groq(old_html, adjustment) if adjustment else old_html
+    html = generate_full_html_with_groq(location, image_urls, labels, recommendations, map_image, record_id)
     send_email(email, f"Updated travel page for {location}", html)
     return "🔁 Rejected → new email sent!"
 
