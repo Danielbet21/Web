@@ -1,7 +1,6 @@
 import os
 import requests
 import smtplib
-import random
 from flask import Flask, request
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -33,33 +32,34 @@ def fetch_images(location, count=3):
     response = requests.get(url, headers=headers)
     results = response.json().get("results", [])
     image_urls, captions = [], []
-
     for img in results:
         image_urls.append(img["urls"]["regular"])
         alt = img["alt_description"] or "No caption available"
         captions.append(alt)
-
     while len(image_urls) < 3:
         image_urls.append("https://via.placeholder.com/300x200?text=No+Image")
         captions.append("No image available")
-
     return image_urls, captions
 
 def process_images_with_groq(image_urls, captions, location):
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     prompt = f"""
-For each image below, give:
+For each of the 3 images below, give:
 1) the correct landmark name (1-3 words)
 2) a short travel recommendation (1-2 sentences)
 
+If the image has no obvious landmark, make a smart guess or repeat the city name.
+
 Images:
 """
-    for i in range(len(image_urls)):
+    for i in range(3):
         prompt += f"- Caption: {captions[i]}, URL: {image_urls[i]}\n"
-
-    prompt += "\nReturn as a numbered list, like:\n1. Charles Bridge | Visit early in the morning for sunrise views.\n"
-
+    prompt += """
+Return as a numbered list with exactly three items.
+Format:
+1. Landmark Name | Recommendation text
+"""
     data = {
         "model": "llama3-70b-8192",
         "messages": [{"role": "user", "content": prompt}],
@@ -67,7 +67,6 @@ Images:
     }
     response = requests.post(url, headers=headers, json=data)
     text = response.json()["choices"][0]["message"]["content"]
-
     labels, recommendations = [], []
     lines = text.strip().split('\n')
     for line in lines:
@@ -80,38 +79,72 @@ Images:
 
 def get_static_map_with_markers(places, city):
     markers = '&'.join([f"markers={place.replace(' ', '+')},{city.replace(' ', '+')}" for place in places])
-    map_url = f"https://maps.googleapis.com/maps/api/staticmap?size=600x300&{markers}&key={GOOGLE_MAPS_API_KEY}"
-    return map_url
+    return f"https://maps.googleapis.com/maps/api/staticmap?size=600x300&{markers}&key={GOOGLE_MAPS_API_KEY}"
 
-def random_color():
-    return random.choice(["#FF6F61", "#6B5B95", "#88B04B", "#F7CAC9", "#92A8D1"])
+def generate_full_html_with_groq(location, image_urls, labels, recommendations, map_image, record_id):
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    prompt = f"""
+Generate a beautiful, modern HTML email using inline CSS.
 
-def build_html(location, image_urls, labels, recommendations, map_image, record_id):
-    header_color = random_color()
-    button_approve_color = "#28a745"
-    button_reject_color = "#dc3545"
-
-    html = f"""
-    <div style="font-family:sans-serif; text-align:center; background-color:#f9f9f9; padding:20px;">
-        <h1 style="color:{header_color};">Travel Guide: {location}</h1>
-        <div>
-    """
+Requirements:
+- Add a bold, stylish header with the city name: {location}.
+- Show 3 image cards, each with:
+    • the image as a clickable link to Google Maps (https://www.google.com/maps/search/?api=1&query=LANDMARK+CITY),
+    • a beautiful title for the landmark,
+    • a short recommendation below.
+- Style the images with rounded corners, soft shadows, max-width ~300px.
+- Use a soft background color or gradient.
+- At the bottom, add:
+    • a large map image: {map_image},
+    • two side-by-side buttons:
+        - green "Approve" button (http://localhost:5000/approve?id={record_id}),
+        - red "Reject" button (http://localhost:5000/reject?id={record_id}),
+    • a form with a textarea and submit button:
+        → action: http://localhost:5000/reject
+        → hidden input name='id' value='{record_id}'
+        → textarea name='adjustment'
+        → submit button label: 'Submit Adjustments'
+        → style it clean, rounded, with soft shadow.
+Important:
+- Do NOT include comments, notes, or explanations in the HTML.
+- Only return the HTML code.
+"""
     for i in range(3):
-        html += f"""
-            <img src="{image_urls[i]}" alt="{labels[i]}" style="max-width:300px; height:auto; border-radius:10px; margin:10px;">
-            <p><b>{labels[i]}</b></p>
-            <p style="color:#555;">{recommendations[i]}</p>
-        """
-    html += f"""
-        </div>
-        <h2 style="color:{header_color}; margin-top:30px;">Landmarks Map</h2>
-        <img src="{map_image}" alt="Map of landmarks" onerror="this.src='https://via.placeholder.com/600x300?text=No+Map+Available';" style="max-width:600px; height:auto; border-radius:10px;">
-        <div style="margin-top:30px;">
-            <a href="http://localhost:5000/approve?id={record_id}" style="background:{button_approve_color}; color:#fff; padding:10px 20px; text-decoration:none; margin-right:10px; border-radius:5px;">Approve</a>
-            <a href="http://localhost:5000/reject?id={record_id}" style="background:{button_reject_color}; color:#fff; padding:10px 20px; text-decoration:none; border-radius:5px;">Reject</a>
-        </div>
-    </div>
-    """
+        maps_url = f"https://www.google.com/maps/search/?api=1&query={labels[i].replace(' ', '+')}+{location.replace(' ', '+')}"
+        prompt += f"\n- Image {i+1}: {image_urls[i]}, Label: {labels[i]}, Recommendation: {recommendations[i]}, Maps URL: {maps_url}"
+    prompt += "\nReturn only the HTML code."
+    data = {
+        "model": "llama3-70b-8192",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.7
+    }
+    response = requests.post(url, headers=headers, json=data)
+    html = response.json()["choices"][0]["message"]["content"]
+    return html
+
+def generate_adjusted_html_with_groq(old_html, adjustment):
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    prompt = f"""
+Here’s the previous HTML email:
+{old_html}
+
+The user requested this adjustment:
+{adjustment}
+
+Regenerate the HTML email accordingly, improving the design as requested.
+- Use inline CSS.
+- Keep the layout, buttons, and form functional.
+- Do NOT add comments or explanations — return only the updated HTML.
+"""
+    data = {
+        "model": "llama3-70b-8192",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.7
+    }
+    response = requests.post(url, headers=headers, json=data)
+    html = response.json()["choices"][0]["message"]["content"]
     return html
 
 def send_email(recipient, subject, body):
@@ -136,20 +169,19 @@ def approve():
 @app.route("/reject")
 def reject():
     record_id = request.args.get("id")
+    adjustment = request.args.get("adjustment", "").strip()
     record_url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_NAME}/{record_id}"
     headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
     record_resp = requests.get(record_url, headers=headers)
     record = record_resp.json()
-
     location = record["fields"].get("Location")
     email = record["fields"].get("Email")
-
     image_urls, captions = fetch_images(location)
     labels, recommendations = process_images_with_groq(image_urls, captions, location)
     map_image = get_static_map_with_markers(labels, location)
-    html = build_html(location, image_urls, labels, recommendations, map_image, record_id)
+    old_html = generate_full_html_with_groq(location, image_urls, labels, recommendations, map_image, record_id)
+    html = generate_adjusted_html_with_groq(old_html, adjustment) if adjustment else old_html
     send_email(email, f"Updated travel page for {location}", html)
-
     return "🔁 Rejected → new email sent!"
 
 def process_entries():
@@ -163,7 +195,7 @@ def process_entries():
         image_urls, captions = fetch_images(location)
         labels, recommendations = process_images_with_groq(image_urls, captions, location)
         map_image = get_static_map_with_markers(labels, location)
-        html = build_html(location, image_urls, labels, recommendations, map_image, record_id)
+        html = generate_full_html_with_groq(location, image_urls, labels, recommendations, map_image, record_id)
         send_email(email, f"Travel page for {location}", html)
     print("✅ Done sending all emails!")
 
